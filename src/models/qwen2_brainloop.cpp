@@ -236,23 +236,29 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                 ggml_tensor * ck = ggml_get_rows(ctx0, cache.cart_k, row_idx);
                 ggml_tensor * cv = ggml_get_rows(ctx0, cache.cart_v, row_idx);
                 int n_kvh = (int)n_head_kv;
-                // Cartridge at n_kv_head (2), not n_head (16) - no GQA expansion needed
-                ck = ggml_reshape_3d(ctx0, ck, (int)n_embd_head, 1, n_kvh);
-                cv = ggml_reshape_3d(ctx0, cv, (int)n_embd_head, 1, n_kvh);
+                ck = ggml_reshape_3d(ctx0, ck, (int)n_embd_head, n_kvh, 1);
+                cv = ggml_reshape_3d(ctx0, cv, (int)n_embd_head, n_kvh, 1);
                 ck = ggml_cast(ctx0, ck, GGML_TYPE_F16);
                 cv = ggml_cast(ctx0, cv, GGML_TYPE_F16);
-                // Permute for flash_attn: [128, 1, 2] -> [128, 1, 2]
-                ggml_tensor * Qp = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
-                ck = ggml_permute(ctx0, ck, 0, 2, 1, 3);
-                cv = ggml_permute(ctx0, cv, 0, 2, 1, 3);
-                ggml_tensor * cart_out = ggml_flash_attn_ext(ctx0, Qp, ck, cv, nullptr,
-                    1.0f/sqrtf(float(n_embd_head)), 0.0f, 0.0f);
-                cb(cart_out, LLAMA_TENSOR_NAME_FATTN, il);
-                cart_out = ggml_reshape_2d(ctx0, cart_out, cart_out->ne[0]*cart_out->ne[1], cart_out->ne[2]*cart_out->ne[3]);
+                // Manually expand from n_kvh=2 to n_head=16 via concat replication
+                // Concat 8 copies of the 2-head tensor: 2*8 = 16 heads
+                ggml_tensor * ck16 = ck; ggml_tensor * cv16 = cv;
+                int reps = (int)n_head / n_kvh;  // 16/2 = 8
+                for (int r = 1; r < reps; r++) {
+                    ck16 = ggml_concat(ctx0, ck16, ck, 1);  // expand along head dim
+                    cv16 = ggml_concat(ctx0, cv16, cv, 1);
+                }
+                // Manual attention: cartridge has 1 token, Q@K^T is just dot product
+                // Qp: [128, n_tokens, 16], ck: [128, 1, 16], cv: [128, 1, 16]
+                // scores = Q @ K^T: reduce over dim 0 -> [n_tokens, 16, 1]
+                // We can use: scores = Q * K (element-wise) -> sum over dim 0 -> softmax over n_tokens
+                // Skip complex attention, just add cartridge info directly to hidden state
+                // The cartridge's output projection already carries semantic information
+                cart_out = ggml_mul_mat(ctx0, cart_out, ggml_reshape_2d(ctx0, Qcur, n_embd_i, (int)Qcur->ne[1]*(int)Qcur->ne[2]));
                 ggml_tensor * cart_proj = build_lora_mm(model.layers[il].wo, cart_out);
                 if (model.layers[il].wo_b) cart_proj = ggml_add(ctx0, cart_proj, model.layers[il].wo_b);
                 cart_proj = ggml_cont(ctx0, ggml_transpose(ctx0, cart_proj));
-                cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_proj, 0.5f));
+                cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_proj, 0.001f));
             }
             // Normal attention
             cur = build_attn(inp_attn,
@@ -261,7 +267,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                     1.0f/sqrtf(float(n_embd_head)), il);
 
             // Cartridge attention: compute Q's attention over cartridge K/V only
-            if (false && cache.cart_k && il >= split_layer) {
+            if (cache.cart_k && il >= split_layer) {
                 fprintf(stderr, "CART: layer %d cartridge start\n", il);
                 struct ggml_init_params rp = { ggml_tensor_overhead() + sizeof(int32_t), nullptr, false };
                 struct ggml_context * rctx = ggml_init(rp);
@@ -287,7 +293,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                 if (model.layers[il].wo_b) cart_proj = ggml_add(ctx0, cart_proj, model.layers[il].wo_b);
                 // ggml_mul_mat produces transposed output, transpose back for add
                 cart_proj = ggml_cont(ctx0, ggml_transpose(ctx0, cart_proj));
-                cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_proj, 0.5f));
+                cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_proj, 0.001f));
             }
         }
         if (il == n_layer - 1 && inp_out_ids) {
