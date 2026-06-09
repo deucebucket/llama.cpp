@@ -1,5 +1,6 @@
 #include "models.h"
 #include <ggml-alloc.h>
+#include "../llama-impl.h"
 #include <fstream>
 #include <vector>
 #include <string>
@@ -52,16 +53,11 @@ struct brainloop_gpu_cache {
     struct ggml_tensor * gate   = nullptr;
     struct ggml_tensor * rev_emb = nullptr;
 
-    // Inline RAG: document index in model's native embedding space
-    struct ggml_tensor * rag_docs = nullptr;
-    int rag_n_docs = 0;
-
-    // KV Cache Hijack: synthetic key/value pairs for forced attention
-    struct ggml_tensor * synth_k = nullptr;  // [n_embd_head * n_kv_head]
-    struct ggml_tensor * synth_v = nullptr;
+    // Cartridge: per-layer K/V from real forward pass
+    struct ggml_tensor * cart_k = nullptr;  // [n_layers, n_kv_dim]
+    struct ggml_tensor * cart_v = nullptr;
 
     float gate_sigmoid = 0.5f;
-    float rag_scale = 0.6225f;  // learned via training: sigmoid(rag_scale)
 };
 
 static brainloop_gpu_cache & get_brainloop_cache(
@@ -168,36 +164,19 @@ static brainloop_gpu_cache & get_brainloop_cache(
 
     cache.initialized = true;
 
-    // Inline RAG: load pre-computed document embeddings
+    // Load cartridge K/V from real model forward pass
     {
-        brainloop_weight bw_rag = load_brainloop_weight("rag-experiment/rag_docs_real.bin");
-        fprintf(stderr, "BRAINLOOP RAG DEBUG: rows=%d cols=%d empty=%d n_embd=%d\n",
-            bw_rag.rows, bw_rag.cols, bw_rag.data.empty(), n_embd);
-        if (!bw_rag.data.empty() && bw_rag.cols == n_embd) {
-            cache.rag_n_docs = bw_rag.rows;
-            struct ggml_init_params rp = { ggml_tensor_overhead() * 2, nullptr, true };
-            struct ggml_context * rctx = ggml_init(rp);
-            cache.rag_docs = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, n_embd, cache.rag_n_docs);
-            ggml_backend_buffer_t rbuf = ggml_backend_alloc_ctx_tensors_from_buft(rctx, buft);
-            ggml_backend_tensor_set(cache.rag_docs, bw_rag.data.data(), 0, bw_rag.data.size() * sizeof(float));
-            fprintf(stderr, "BRAINLOOP: loaded RAG index: %d docs x %d dim on %s\n",
-                cache.rag_n_docs, n_embd, ggml_backend_buffer_name(rbuf));
-        }
-    }
-
-    // KV Cache Hijack: load synthetic K and V for forced attention
-    {
-        brainloop_weight bw_k = load_brainloop_weight("rag-experiment/canary_k.bin");
-        brainloop_weight bw_v = load_brainloop_weight("rag-experiment/canary_v.bin");
+        brainloop_weight bw_k = load_brainloop_weight("rag-experiment/cartridge_k.bin");
+        brainloop_weight bw_v = load_brainloop_weight("rag-experiment/cartridge_v.bin");
         if (!bw_k.data.empty() && !bw_v.data.empty()) {
             struct ggml_init_params rp = { ggml_tensor_overhead() * 2, nullptr, true };
             struct ggml_context * rctx = ggml_init(rp);
-            cache.synth_k = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, bw_k.cols, bw_k.rows);
-            cache.synth_v = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, bw_v.cols, bw_v.rows);
+            cache.cart_k = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, bw_k.cols, bw_k.rows);
+            cache.cart_v = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, bw_v.cols, bw_v.rows);
             ggml_backend_buffer_t rbuf = ggml_backend_alloc_ctx_tensors_from_buft(rctx, buft);
-            ggml_backend_tensor_set(cache.synth_k, bw_k.data.data(), 0, bw_k.data.size() * sizeof(float));
-            ggml_backend_tensor_set(cache.synth_v, bw_v.data.data(), 0, bw_v.data.size() * sizeof(float));
-            fprintf(stderr, "BRAINLOOP: loaded synthetic KV for hijack\n");
+            ggml_backend_tensor_set(cache.cart_k, bw_k.data.data(), 0, bw_k.data.size() * sizeof(float));
+            ggml_backend_tensor_set(cache.cart_v, bw_v.data.data(), 0, bw_v.data.size() * sizeof(float));
+            fprintf(stderr, "BRAINLOOP: loaded cartridge K/V (%d layers x %d dim)\n", bw_k.rows, bw_k.cols);
         }
     }
 
@@ -212,8 +191,8 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
 
-    const int split_layer = n_layer / 2;  // midpoint for any model size
-    const int n_rev = 2;  // matches RAG training config (REVS=2)
+    const int split_layer = 18;
+    const int n_rev = 1;
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -231,16 +210,6 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
 
     int n_embd_i = (int)hparams.n_embd;
     int n_head_i = (int)hparams.n_head();
-    ggml_tensor * rag_ctx_cached = nullptr;
-
-    // Query RAG at embedding level (before any layers)
-    if (cache.rag_docs) {
-        ggml_tensor * sim = ggml_mul_mat(ctx0, cache.rag_docs, inpL);
-        sim = ggml_scale(ctx0, sim, 50.0f);
-        sim = ggml_soft_max(ctx0, sim);
-        ggml_tensor * t_rag = ggml_cont(ctx0, ggml_transpose(ctx0, cache.rag_docs));
-        rag_ctx_cached = ggml_mul_mat(ctx0, t_rag, sim);
-    }
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -259,36 +228,30 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
-            // KV Hijack: inject synthetic K/V, then cont for flash_attn strides
-            if (cache.synth_k && il >= split_layer) {
+            // Cartridge injection: per-layer K/V from real forward pass
+            if (false && cache.cart_k && il >= split_layer) {
+                // Extract this layer'''s cartridge K/V: row il
+                ggml_tensor * row_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+                if (row_idx->data) ((int32_t*)row_idx->data)[0] = il;
+                ggml_tensor * ck = ggml_get_rows(ctx0, cache.cart_k, row_idx);
+                ggml_tensor * cv = ggml_get_rows(ctx0, cache.cart_v, row_idx);
+                // Reshape to match multi-head: [n_embd_head*n_kv_head] -> [n_embd_head, n_kv_head, 1]
                 int n_kvh = (int)n_head_kv;
-                ggml_tensor * sk = ggml_reshape_3d(ctx0, cache.synth_k, (int)n_embd_head, n_kvh, 1);
-                ggml_tensor * sv = ggml_reshape_3d(ctx0, cache.synth_v, (int)n_embd_head, n_kvh, 1);
-                sk = ggml_cast(ctx0, sk, GGML_TYPE_F32);
-                sv = ggml_cast(ctx0, sv, GGML_TYPE_F32);
-                ggml_tensor * Kf32 = ggml_cast(ctx0, Kcur, GGML_TYPE_F32);
-                ggml_tensor * Vf32 = ggml_cast(ctx0, Vcur, GGML_TYPE_F32);
-                // concat + cont for flash_attn stride compatibility
-                Kcur = ggml_cont(ctx0, ggml_concat(ctx0, Kf32, sk, 2));
-                Vcur = ggml_cont(ctx0, ggml_concat(ctx0, Vf32, sv, 2));
+                ck = ggml_reshape_3d(ctx0, ck, (int)n_embd_head, n_kvh, 1);
+                cv = ggml_reshape_3d(ctx0, cv, (int)n_embd_head, n_kvh, 1);
+                // Cast to F16 (flash_attn expects F16 for K/V)
+                ck = ggml_cast(ctx0, ck, GGML_TYPE_F16);
+                cv = ggml_cast(ctx0, cv, GGML_TYPE_F16);
+                if (Kcur->type == GGML_TYPE_F32) Kcur = ggml_cast(ctx0, Kcur, GGML_TYPE_F16);
+                if (Vcur->type == GGML_TYPE_F32) Vcur = ggml_cast(ctx0, Vcur, GGML_TYPE_F16);
+                // Concat cartridge tokens to K/V
+                Kcur = ggml_cont(ctx0, ggml_concat(ctx0, Kcur, ck, 2));
+                Vcur = ggml_cont(ctx0, ggml_concat(ctx0, Vcur, cv, 2));
             }
-
-            // Use direct flash_attn when KV hijack adds tokens (different seq lens)
-            if (false && cache.synth_k && il >= split_layer) {
-                Qcur = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
-                Kcur = ggml_permute(ctx0, Kcur, 0, 2, 1, 3);
-                Vcur = ggml_permute(ctx0, Vcur, 0, 2, 1, 3);
-                ggml_tensor * KQV = ggml_flash_attn_ext(ctx0, Qcur, Kcur, Vcur, nullptr,
-                    1.0f/sqrtf(float(n_embd_head)), 0.0f, 0.0f);
-                KQV = ggml_reshape_2d(ctx0, KQV, KQV->ne[0]*KQV->ne[1], KQV->ne[2]*KQV->ne[3]);
-                cur = build_lora_mm(model.layers[il].wo, KQV);
-                if (model.layers[il].wo_b) cur = ggml_add(ctx0, cur, model.layers[il].wo_b);
-            } else {
-                cur = build_attn(inp_attn,
+            cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     1.0f/sqrtf(float(n_embd_head)), il);
-            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
@@ -311,20 +274,6 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
         cur = ggml_add(ctx0, cur, ffn_inp);
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
-
-        // Hand-to-hand: progressive blend from layer 0 through 35
-        // Phase 1 (0-7): inception - tiny seed (1-8%)
-        // Phase 2 (8-17): fact finding - ramp up (10-50%)
-        // Phase 3 (18-35): reasoning + output - dominate (55-100%)
-        if (rag_ctx_cached && il <= 35) {
-            float blend;
-            if (il < 8)       blend = (il + 1) * 0.01f;       // 1-8%
-            else if (il < 18) blend = 0.08f + (il-7)*0.04f;    // 12-48%
-            else              blend = 0.50f + (il-17)*0.03f;   // 53-104%
-            ggml_tensor * rag_part = ggml_scale(ctx0, rag_ctx_cached, blend);
-            ggml_tensor * model_part = ggml_scale(ctx0, cur, 1.0f - blend);
-            cur = ggml_add(ctx0, model_part, rag_part);
-        }
 
         // BRAINLOOP: after layer 17, before 18 — matches PyTorch placement
         if (use_brainloop && il == split_layer - 1) {
@@ -382,16 +331,6 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                 if (cache.dn_b) f_dn = ggml_add(ctx0, f_dn, cache.dn_b);
                 x = ggml_add(ctx0, x, f_dn);
 
-                // Inline RAG: hard top-1 via sharp softmax (temperature-scaled)
-                if (cache.rag_docs) {
-                    ggml_tensor * sim = ggml_mul_mat(ctx0, cache.rag_docs, x);
-                    sim = ggml_scale(ctx0, sim, 500.0f); // sharpen to near-argmax
-                    sim = ggml_soft_max(ctx0, sim);
-                    ggml_tensor * t_rag = ggml_cont(ctx0, ggml_transpose(ctx0, cache.rag_docs));
-                    ggml_tensor * rag_ctx = ggml_mul_mat(ctx0, t_rag, sim);
-                    x = ggml_add(ctx0, x, ggml_scale(ctx0, rag_ctx, cache.rag_scale));
-                }
-
                 // Gated residual
                 ggml_tensor * delta = ggml_sub(ctx0, x, cur);
                 delta = ggml_mul(ctx0, delta, ggml_sigmoid(ctx0, cache.gate));
@@ -413,25 +352,6 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    // Logit bias: boost canary tokens only (CPU-allocated, no suppression)
-    {
-        int n_vocab = llama_vocab_n_tokens(&model.vocab);
-        struct ggml_init_params bp = {
-            ggml_tensor_overhead() + n_vocab * sizeof(float), nullptr, false
-        };
-        struct ggml_context * bctx = ggml_init(bp);
-        ggml_tensor * bias = ggml_new_tensor_1d(bctx, GGML_TYPE_F32, n_vocab);
-        if (bias->data) {
-            memset(bias->data, 0, n_vocab * sizeof(float));
-            float * d = (float *)bias->data;
-            int ids[] = {8847, 36, 48021, 53, 300, 41121, 57, 324, 713, 44220, 372, 641, 7660, 811, 79281, 3313, 67, 22280, 22, 12, 42539, 278, 46111, 4203};
-            int n = sizeof(ids)/sizeof(ids[0]);
-            for (int i = 0; i < n; i++) if (ids[i] < n_vocab) d[ids[i]] = 500.0f;
-        }
-        cur = ggml_add(ctx0, cur, bias);
-        res->t_logits = cur;
-    }
 
     ggml_build_forward_expand(gf, cur);
 }
