@@ -56,6 +56,10 @@ struct brainloop_gpu_cache {
     struct ggml_tensor * rag_docs = nullptr;
     int rag_n_docs = 0;
 
+    // KV Cache Hijack: synthetic key/value pairs for forced attention
+    struct ggml_tensor * synth_k = nullptr;  // [n_embd_head * n_kv_head]
+    struct ggml_tensor * synth_v = nullptr;
+
     float gate_sigmoid = 0.5f;
     float rag_scale = 0.6225f;  // learned via training: sigmoid(rag_scale)
 };
@@ -167,6 +171,8 @@ static brainloop_gpu_cache & get_brainloop_cache(
     // Inline RAG: load pre-computed document embeddings
     {
         brainloop_weight bw_rag = load_brainloop_weight("rag-experiment/rag_docs_real.bin");
+        fprintf(stderr, "BRAINLOOP RAG DEBUG: rows=%d cols=%d empty=%d n_embd=%d\n",
+            bw_rag.rows, bw_rag.cols, bw_rag.data.empty(), n_embd);
         if (!bw_rag.data.empty() && bw_rag.cols == n_embd) {
             cache.rag_n_docs = bw_rag.rows;
             struct ggml_init_params rp = { ggml_tensor_overhead() * 2, nullptr, true };
@@ -176,6 +182,22 @@ static brainloop_gpu_cache & get_brainloop_cache(
             ggml_backend_tensor_set(cache.rag_docs, bw_rag.data.data(), 0, bw_rag.data.size() * sizeof(float));
             fprintf(stderr, "BRAINLOOP: loaded RAG index: %d docs x %d dim on %s\n",
                 cache.rag_n_docs, n_embd, ggml_backend_buffer_name(rbuf));
+        }
+    }
+
+    // KV Cache Hijack: load synthetic K and V for forced attention
+    {
+        brainloop_weight bw_k = load_brainloop_weight("rag-experiment/canary_k.bin");
+        brainloop_weight bw_v = load_brainloop_weight("rag-experiment/canary_v.bin");
+        if (!bw_k.data.empty() && !bw_v.data.empty()) {
+            struct ggml_init_params rp = { ggml_tensor_overhead() * 2, nullptr, true };
+            struct ggml_context * rctx = ggml_init(rp);
+            cache.synth_k = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, bw_k.cols, bw_k.rows);
+            cache.synth_v = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, bw_v.cols, bw_v.rows);
+            ggml_backend_buffer_t rbuf = ggml_backend_alloc_ctx_tensors_from_buft(rctx, buft);
+            ggml_backend_tensor_set(cache.synth_k, bw_k.data.data(), 0, bw_k.data.size() * sizeof(float));
+            ggml_backend_tensor_set(cache.synth_v, bw_v.data.data(), 0, bw_v.data.size() * sizeof(float));
+            fprintf(stderr, "BRAINLOOP: loaded synthetic KV for hijack\n");
         }
     }
 
@@ -209,6 +231,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
 
     int n_embd_i = (int)hparams.n_embd;
     int n_head_i = (int)hparams.n_head();
+    ggml_tensor * rag_ctx_cached = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -226,6 +249,16 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
             Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
+
+            // KV Hijack: inject synthetic K/V for forced attention after refiner
+            // (disabled - ggml_concat shape mismatch needs debugging)
+            if (false && cache.synth_k && il >= split_layer) {
+                int n_kvh = (int)n_head_kv;
+                ggml_tensor * sk = ggml_reshape_3d(ctx0, cache.synth_k, (int)n_embd_head, n_kvh, 1);
+                ggml_tensor * sv = ggml_reshape_3d(ctx0, cache.synth_v, (int)n_embd_head, n_kvh, 1);
+                Kcur = ggml_concat(ctx0, Kcur, sk, 2);
+                Vcur = ggml_concat(ctx0, Vcur, sv, 2);
+            }
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
@@ -253,6 +286,22 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
         cur = ggml_add(ctx0, cur, ffn_inp);
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        // Query RAG once at layer 17 (knowledge boundary), cache for gas cloud
+        if (cache.rag_docs && il == split_layer - 1 && !rag_ctx_cached) {
+            ggml_tensor * sim = ggml_mul_mat(ctx0, cache.rag_docs, cur);
+            sim = ggml_scale(ctx0, sim, 50.0f);
+            sim = ggml_soft_max(ctx0, sim);
+            ggml_tensor * t_rag = ggml_cont(ctx0, ggml_transpose(ctx0, cache.rag_docs));
+            rag_ctx_cached = ggml_mul_mat(ctx0, t_rag, sim);
+        }
+
+        // Gas cloud: inject only at last token position (prediction point)
+        if (rag_ctx_cached && il >= 20 && il <= 26) {
+            // Extract last token position and inject there
+            ggml_tensor * last_col = ggml_view_1d(ctx0, rag_ctx_cached, n_embd_i, n_embd_i * (int)cur->ne[1]);  // WRONG
+            (void)last_col;
+        }
 
         // BRAINLOOP: after layer 17, before 18 — matches PyTorch placement
         if (use_brainloop && il == split_layer - 1) {
@@ -313,7 +362,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                 // Inline RAG: hard top-1 via sharp softmax (temperature-scaled)
                 if (cache.rag_docs) {
                     ggml_tensor * sim = ggml_mul_mat(ctx0, cache.rag_docs, x);
-                    sim = ggml_scale(ctx0, sim, 50.0f); // sharpen to near-argmax
+                    sim = ggml_scale(ctx0, sim, 500.0f); // sharpen to near-argmax
                     sim = ggml_soft_max(ctx0, sim);
                     ggml_tensor * t_rag = ggml_cont(ctx0, ggml_transpose(ctx0, cache.rag_docs));
                     ggml_tensor * rag_ctx = ggml_mul_mat(ctx0, t_rag, sim);
