@@ -190,7 +190,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
 
-    const int split_layer = 18;
+    const int split_layer = n_layer / 2;  // midpoint for any model size
     const int n_rev = 2;  // matches RAG training config (REVS=2)
 
     ggml_tensor * cur;
