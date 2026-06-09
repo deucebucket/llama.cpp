@@ -161,91 +161,6 @@ static brainloop_gpu_cache & get_brainloop_cache(
     return cache;
 }
 
-static ggml_tensor * brainloop_refine_pass(
-    ggml_context * ctx0,
-    ggml_tensor * hidden,
-    int rev,
-    ggml_tensor * ln1_w, ggml_tensor * ln1_b,
-    ggml_tensor * ln2_w, ggml_tensor * ln2_b,
-    ggml_tensor * attn_q_w, ggml_tensor * attn_q_b,
-    ggml_tensor * attn_k_w, ggml_tensor * attn_k_b,
-    ggml_tensor * attn_v_w, ggml_tensor * attn_v_b,
-    ggml_tensor * attn_o_w, ggml_tensor * attn_o_b,
-    ggml_tensor * ffn_up_w, ggml_tensor * ffn_up_b,
-    ggml_tensor * ffn_down_w, ggml_tensor * ffn_down_b,
-    ggml_tensor * gate,
-    ggml_tensor * rev_emb,
-    int n_embd, int n_head, int n_embd_head,
-    ggml_tensor * inp_pos,
-    float freq_base, int n_ctx_orig, int rope_type
-) {
-    int n_tokens = (int)hidden->ne[1];
-
-    ggml_tensor * x = hidden;
-
-    // Revolution embedding
-    {
-        ggml_tensor * rev_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
-        if (rev_idx->data) {
-            ((int32_t *)rev_idx->data)[0] = rev;
-        }
-        ggml_tensor * rev_vec = ggml_get_rows(ctx0, rev_emb, rev_idx);
-        x = ggml_add(ctx0, x, ggml_repeat(ctx0, rev_vec, x));
-    }
-
-    // Self-Attention with RMS norm + residual
-    ggml_tensor * normed = ggml_rms_norm(ctx0, x, 1e-6f);
-    normed = ggml_mul(ctx0, normed, ln1_w);
-    if (ln1_b) normed = ggml_add(ctx0, normed, ln1_b);
-
-    ggml_tensor * Qcur = ggml_mul_mat(ctx0, attn_q_w, normed);
-    if (attn_q_b) Qcur = ggml_add(ctx0, Qcur, attn_q_b);
-    ggml_tensor * Kcur = ggml_mul_mat(ctx0, attn_k_w, normed);
-    if (attn_k_b) Kcur = ggml_add(ctx0, Kcur, attn_k_b);
-    ggml_tensor * Vcur = ggml_mul_mat(ctx0, attn_v_w, normed);
-    if (attn_v_b) Vcur = ggml_add(ctx0, Vcur, attn_v_b);
-
-    Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head, n_tokens);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head, n_tokens);
-
-    Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
-        n_embd_head, rope_type, n_ctx_orig, freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
-        n_embd_head, rope_type, n_ctx_orig, freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-
-    ggml_tensor * KQV = ggml_flash_attn_ext(ctx0, Qcur, Kcur, Vcur, nullptr,
-        1.0f / sqrtf((float)n_embd_head), 0.0f, 0.0f);
-
-    KQV = ggml_reshape_2d(ctx0, KQV, n_embd, n_tokens);
-
-    ggml_tensor * attn_out = ggml_mul_mat(ctx0, attn_o_w, KQV);
-    if (attn_o_b) attn_out = ggml_add(ctx0, attn_out, attn_o_b);
-
-    x = ggml_add(ctx0, x, attn_out);
-
-    // FFN with RMS norm + residual
-    ggml_tensor * normed2 = ggml_rms_norm(ctx0, x, 1e-6f);
-    normed2 = ggml_mul(ctx0, normed2, ln2_w);
-    if (ln2_b) normed2 = ggml_add(ctx0, normed2, ln2_b);
-
-    ggml_tensor * ffn_hidden = ggml_mul_mat(ctx0, ffn_up_w, normed2);
-    if (ffn_up_b) ffn_hidden = ggml_add(ctx0, ffn_hidden, ffn_up_b);
-    ffn_hidden = ggml_gelu(ctx0, ffn_hidden);
-    ggml_tensor * ffn_out = ggml_mul_mat(ctx0, ffn_down_w, ffn_hidden);
-    if (ffn_down_b) ffn_out = ggml_add(ctx0, ffn_out, ffn_down_b);
-
-    x = ggml_add(ctx0, x, ffn_out);
-
-    // Gated residual
-    ggml_tensor * delta = ggml_sub(ctx0, x, hidden);
-    ggml_tensor * gate_val = ggml_sigmoid(ctx0, gate);
-    delta = ggml_mul(ctx0, gate_val, delta);
-    x = ggml_add(ctx0, hidden, delta);
-
-    return x;
-}
-
 llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
     const llama_model & model, const llm_graph_params & params
 ) : llm_graph_context(params) {
@@ -255,7 +170,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
     GGML_ASSERT(n_embd_head == n_rot);
 
     const int split_layer = 18;
-    const int n_rev = 2;
+    const int n_rev = 1;
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -318,8 +233,8 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        // BRAINLOOP: full attention+FFN refiner at split layer
-        if (use_brainloop && il == split_layer) {
+        // BRAINLOOP: after layer 17, before 18 — matches PyTorch placement
+        if (use_brainloop && il == split_layer - 1) {
             float kq_scale = 1.0f / sqrtf((float)n_embd_head);
             for (int rev = 0; rev < n_rev; ++rev) {
                 ggml_tensor * x = cur;
@@ -350,8 +265,9 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                     (int)n_embd_head, rope_type, (int)n_ctx_orig, freq_base,
                     1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-                // Multi-head attention via build_attn_mha (no explicit mask;
-                // flash attention with 3D tensors is bidirectional by default)
+                // Multi-head attention via build_attn_mha
+                // (mask=nullptr — hidden states at this point are already
+                //  causally encoded by the autogressive base model)
                 ggml_tensor * attn_out = build_attn_mha(
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, nullptr,
                     kq_scale, split_layer);
