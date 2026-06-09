@@ -228,27 +228,31 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
-            // Cartridge injection: per-layer K/V from real forward pass
             if (false && cache.cart_k && il >= split_layer) {
-                // Extract this layer's cartridge K/V using CPU-allocated row index
                 struct ggml_init_params rp = { ggml_tensor_overhead() + sizeof(int32_t), nullptr, false };
                 struct ggml_context * rctx = ggml_init(rp);
                 ggml_tensor * row_idx = ggml_new_tensor_1d(rctx, GGML_TYPE_I32, 1);
                 if (row_idx->data) ((int32_t*)row_idx->data)[0] = il;
                 ggml_tensor * ck = ggml_get_rows(ctx0, cache.cart_k, row_idx);
                 ggml_tensor * cv = ggml_get_rows(ctx0, cache.cart_v, row_idx);
-                // Reshape to match multi-head: [n_embd_head*n_kv_head] -> [n_embd_head, n_kv_head, 1]
                 int n_kvh = (int)n_head_kv;
-                ck = ggml_reshape_3d(ctx0, ck, (int)n_embd_head, n_kvh, 1);
-                cv = ggml_reshape_3d(ctx0, cv, (int)n_embd_head, n_kvh, 1);
-                // Cast to F16 (flash_attn expects F16 for K/V)
+                // Cartridge at n_kv_head (2), not n_head (16) - no GQA expansion needed
+                ck = ggml_reshape_3d(ctx0, ck, (int)n_embd_head, 1, n_kvh);
+                cv = ggml_reshape_3d(ctx0, cv, (int)n_embd_head, 1, n_kvh);
                 ck = ggml_cast(ctx0, ck, GGML_TYPE_F16);
                 cv = ggml_cast(ctx0, cv, GGML_TYPE_F16);
-                if (Kcur->type == GGML_TYPE_F32) Kcur = ggml_cast(ctx0, Kcur, GGML_TYPE_F16);
-                if (Vcur->type == GGML_TYPE_F32) Vcur = ggml_cast(ctx0, Vcur, GGML_TYPE_F16);
-                // Concat cartridge tokens to K/V
-                Kcur = ggml_cont(ctx0, ggml_concat(ctx0, Kcur, ck, 2));
-                Vcur = ggml_cont(ctx0, ggml_concat(ctx0, Vcur, cv, 2));
+                // Permute for flash_attn: [128, 1, 2] -> [128, 1, 2]
+                ggml_tensor * Qp = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+                ck = ggml_permute(ctx0, ck, 0, 2, 1, 3);
+                cv = ggml_permute(ctx0, cv, 0, 2, 1, 3);
+                ggml_tensor * cart_out = ggml_flash_attn_ext(ctx0, Qp, ck, cv, nullptr,
+                    1.0f/sqrtf(float(n_embd_head)), 0.0f, 0.0f);
+                cb(cart_out, LLAMA_TENSOR_NAME_FATTN, il);
+                cart_out = ggml_reshape_2d(ctx0, cart_out, cart_out->ne[0]*cart_out->ne[1], cart_out->ne[2]*cart_out->ne[3]);
+                ggml_tensor * cart_proj = build_lora_mm(model.layers[il].wo, cart_out);
+                if (model.layers[il].wo_b) cart_proj = ggml_add(ctx0, cart_proj, model.layers[il].wo_b);
+                cart_proj = ggml_cont(ctx0, ggml_transpose(ctx0, cart_proj));
+                cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_proj, 0.5f));
             }
             // Normal attention
             cur = build_attn(inp_attn,
