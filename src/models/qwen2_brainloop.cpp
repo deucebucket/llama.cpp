@@ -52,7 +52,12 @@ struct brainloop_gpu_cache {
     struct ggml_tensor * gate   = nullptr;
     struct ggml_tensor * rev_emb = nullptr;
 
+    // Inline RAG: document index in model's native embedding space
+    struct ggml_tensor * rag_docs = nullptr;
+    int rag_n_docs = 0;
+
     float gate_sigmoid = 0.5f;
+    float rag_scale = 0.6225f;  // learned via training: sigmoid(rag_scale)
 };
 
 static brainloop_gpu_cache & get_brainloop_cache(
@@ -158,6 +163,22 @@ static brainloop_gpu_cache & get_brainloop_cache(
         ggml_backend_buffer_name(buf), cache.gate_sigmoid, n_tensors);
 
     cache.initialized = true;
+
+    // Inline RAG: load pre-computed document embeddings
+    {
+        brainloop_weight bw_rag = load_brainloop_weight("rag-experiment/rag_docs_real.bin");
+        if (!bw_rag.data.empty() && bw_rag.cols == n_embd) {
+            cache.rag_n_docs = bw_rag.rows;
+            struct ggml_init_params rp = { ggml_tensor_overhead() * 2, nullptr, true };
+            struct ggml_context * rctx = ggml_init(rp);
+            cache.rag_docs = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, n_embd, cache.rag_n_docs);
+            ggml_backend_buffer_t rbuf = ggml_backend_alloc_ctx_tensors_from_buft(rctx, buft);
+            ggml_backend_tensor_set(cache.rag_docs, bw_rag.data.data(), 0, bw_rag.data.size() * sizeof(float));
+            fprintf(stderr, "BRAINLOOP: loaded RAG index: %d docs x %d dim on %s\n",
+                cache.rag_n_docs, n_embd, ggml_backend_buffer_name(rbuf));
+        }
+    }
+
     return cache;
 }
 
@@ -170,7 +191,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
     GGML_ASSERT(n_embd_head == n_rot);
 
     const int split_layer = 18;
-    const int n_rev = 1;
+    const int n_rev = 2;  // matches RAG training config (REVS=2)
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -288,6 +309,16 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                 ggml_tensor * f_dn  = ggml_mul_mat(ctx0, cache.dn_w, f_act);
                 if (cache.dn_b) f_dn = ggml_add(ctx0, f_dn, cache.dn_b);
                 x = ggml_add(ctx0, x, f_dn);
+
+                // Inline RAG: hard top-1 via sharp softmax (temperature-scaled)
+                if (cache.rag_docs) {
+                    ggml_tensor * sim = ggml_mul_mat(ctx0, cache.rag_docs, x);
+                    sim = ggml_scale(ctx0, sim, 50.0f); // sharpen to near-argmax
+                    sim = ggml_soft_max(ctx0, sim);
+                    ggml_tensor * t_rag = ggml_cont(ctx0, ggml_transpose(ctx0, cache.rag_docs));
+                    ggml_tensor * rag_ctx = ggml_mul_mat(ctx0, t_rag, sim);
+                    x = ggml_add(ctx0, x, ggml_scale(ctx0, rag_ctx, cache.rag_scale));
+                }
 
                 // Gated residual
                 ggml_tensor * delta = ggml_sub(ctx0, x, cur);
