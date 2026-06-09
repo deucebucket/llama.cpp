@@ -526,6 +526,10 @@ struct llm_build_qwen2 : public llm_graph_context {
     llm_build_qwen2(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_qwen2_brainloop : public llm_graph_context {
+    llm_build_qwen2_brainloop(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_qwen2moe : public llm_graph_context {
     llm_build_qwen2moe(const llama_model & model, const llm_graph_params & params);
 };

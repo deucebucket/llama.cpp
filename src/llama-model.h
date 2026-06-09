@@ -494,6 +494,17 @@ struct llama_layer {
     struct llama_layer_shortconv shortconv;
 
     struct llama_layer_nextn nextn;
+
+    // Brainloop refiner tensors (only at split layer)
+    struct ggml_tensor * bl_attn_q     = nullptr;
+    struct ggml_tensor * bl_attn_k     = nullptr;
+    struct ggml_tensor * bl_attn_v     = nullptr;
+    struct ggml_tensor * bl_attn_out   = nullptr;
+    struct ggml_tensor * bl_ffn_gate   = nullptr;
+    struct ggml_tensor * bl_ffn_up     = nullptr;
+    struct ggml_tensor * bl_ffn_down   = nullptr;
+    struct ggml_tensor * bl_ln1        = nullptr;
+    struct ggml_tensor * bl_gate       = nullptr;
 };
 
 struct llama_device {
