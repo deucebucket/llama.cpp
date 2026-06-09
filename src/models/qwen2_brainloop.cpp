@@ -259,24 +259,36 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
-            // KV Hijack: disabled - flash_attn doesn't handle concat'd tensor strides
-            if (false && cache.synth_k && il >= split_layer) {
+            // KV Hijack: inject synthetic K/V, then cont for flash_attn strides
+            if (cache.synth_k && il >= split_layer) {
                 int n_kvh = (int)n_head_kv;
                 ggml_tensor * sk = ggml_reshape_3d(ctx0, cache.synth_k, (int)n_embd_head, n_kvh, 1);
                 ggml_tensor * sv = ggml_reshape_3d(ctx0, cache.synth_v, (int)n_embd_head, n_kvh, 1);
-                // Cast all to F32 (CUDA concat requires F32)
                 sk = ggml_cast(ctx0, sk, GGML_TYPE_F32);
                 sv = ggml_cast(ctx0, sv, GGML_TYPE_F32);
                 ggml_tensor * Kf32 = ggml_cast(ctx0, Kcur, GGML_TYPE_F32);
                 ggml_tensor * Vf32 = ggml_cast(ctx0, Vcur, GGML_TYPE_F32);
-                Kcur = ggml_concat(ctx0, Kf32, sk, 2);
-                Vcur = ggml_concat(ctx0, Vf32, sv, 2);
+                // concat + cont for flash_attn stride compatibility
+                Kcur = ggml_cont(ctx0, ggml_concat(ctx0, Kf32, sk, 2));
+                Vcur = ggml_cont(ctx0, ggml_concat(ctx0, Vf32, sv, 2));
             }
 
-            cur = build_attn(inp_attn,
+            // Use direct flash_attn when KV hijack adds tokens (different seq lens)
+            if (false && cache.synth_k && il >= split_layer) {
+                Qcur = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+                Kcur = ggml_permute(ctx0, Kcur, 0, 2, 1, 3);
+                Vcur = ggml_permute(ctx0, Vcur, 0, 2, 1, 3);
+                ggml_tensor * KQV = ggml_flash_attn_ext(ctx0, Qcur, Kcur, Vcur, nullptr,
+                    1.0f/sqrtf(float(n_embd_head)), 0.0f, 0.0f);
+                KQV = ggml_reshape_2d(ctx0, KQV, KQV->ne[0]*KQV->ne[1], KQV->ne[2]*KQV->ne[3]);
+                cur = build_lora_mm(model.layers[il].wo, KQV);
+                if (model.layers[il].wo_b) cur = ggml_add(ctx0, cur, model.layers[il].wo_b);
+            } else {
+                cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     1.0f/sqrtf(float(n_embd_head)), il);
+            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
