@@ -275,10 +275,13 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                 cv = ggml_permute(ctx0, cv, 0, 2, 1, 3);
                 ggml_tensor * cart_out = ggml_flash_attn_ext(ctx0, Qp, ck, cv, nullptr,
                     1.0f/sqrtf(float(n_embd_head)), 0.0f, 0.0f);
+                cb(cart_out, LLAMA_TENSOR_NAME_FATTN, il);
                 cart_out = ggml_reshape_2d(ctx0, cart_out, cart_out->ne[0]*cart_out->ne[1], cart_out->ne[2]*cart_out->ne[3]);
                 // Project cartridge attention output and add to main output
                 ggml_tensor * cart_proj = build_lora_mm(model.layers[il].wo, cart_out);
                 if (model.layers[il].wo_b) cart_proj = ggml_add(ctx0, cart_proj, model.layers[il].wo_b);
+                // ggml_mul_mat produces transposed output, transpose back for add
+                cart_proj = ggml_cont(ctx0, ggml_transpose(ctx0, cart_proj));
                 cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_proj, 0.5f));
             }
         }
