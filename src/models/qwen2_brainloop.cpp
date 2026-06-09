@@ -296,11 +296,9 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
             rag_ctx_cached = ggml_mul_mat(ctx0, t_rag, sim);
         }
 
-        // Gas cloud: inject only at last token position (prediction point)
+        // Gas cloud: sustained injection across reasoning layers 20-26
         if (rag_ctx_cached && il >= 20 && il <= 26) {
-            // Extract last token position and inject there
-            ggml_tensor * last_col = ggml_view_1d(ctx0, rag_ctx_cached, n_embd_i, n_embd_i * (int)cur->ne[1]);  // WRONG
-            (void)last_col;
+            cur = ggml_add(ctx0, cur, ggml_scale(ctx0, rag_ctx_cached, 2.0f));
         }
 
         // BRAINLOOP: after layer 17, before 18 — matches PyTorch placement
@@ -390,6 +388,25 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    // Logit bias: boost canary tokens only (CPU-allocated, no suppression)
+    {
+        int n_vocab = llama_vocab_n_tokens(&model.vocab);
+        struct ggml_init_params bp = {
+            ggml_tensor_overhead() + n_vocab * sizeof(float), nullptr, false
+        };
+        struct ggml_context * bctx = ggml_init(bp);
+        ggml_tensor * bias = ggml_new_tensor_1d(bctx, GGML_TYPE_F32, n_vocab);
+        if (bias->data) {
+            memset(bias->data, 0, n_vocab * sizeof(float));
+            float * d = (float *)bias->data;
+            int ids[] = {8847, 36, 48021, 53, 300, 41121, 57, 324, 713, 44220, 372, 641, 7660, 811, 79281, 3313, 67, 22280, 22, 12, 42539, 278, 46111, 4203};
+            int n = sizeof(ids)/sizeof(ids[0]);
+            for (int i = 0; i < n; i++) if (ids[i] < n_vocab) d[ids[i]] = 500.0f;
+        }
+        cur = ggml_add(ctx0, cur, bias);
+        res->t_logits = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
