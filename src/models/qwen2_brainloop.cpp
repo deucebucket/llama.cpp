@@ -233,6 +233,15 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
     int n_head_i = (int)hparams.n_head();
     ggml_tensor * rag_ctx_cached = nullptr;
 
+    // Query RAG at embedding level (before any layers)
+    if (cache.rag_docs) {
+        ggml_tensor * sim = ggml_mul_mat(ctx0, cache.rag_docs, inpL);
+        sim = ggml_scale(ctx0, sim, 50.0f);
+        sim = ggml_soft_max(ctx0, sim);
+        ggml_tensor * t_rag = ggml_cont(ctx0, ggml_transpose(ctx0, cache.rag_docs));
+        rag_ctx_cached = ggml_mul_mat(ctx0, t_rag, sim);
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -250,14 +259,18 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
-            // KV Hijack: inject synthetic K/V for forced attention after refiner
-            // (disabled - ggml_concat shape mismatch needs debugging)
+            // KV Hijack: disabled - flash_attn doesn't handle concat'd tensor strides
             if (false && cache.synth_k && il >= split_layer) {
                 int n_kvh = (int)n_head_kv;
                 ggml_tensor * sk = ggml_reshape_3d(ctx0, cache.synth_k, (int)n_embd_head, n_kvh, 1);
                 ggml_tensor * sv = ggml_reshape_3d(ctx0, cache.synth_v, (int)n_embd_head, n_kvh, 1);
-                Kcur = ggml_concat(ctx0, Kcur, sk, 2);
-                Vcur = ggml_concat(ctx0, Vcur, sv, 2);
+                // Cast all to F32 (CUDA concat requires F32)
+                sk = ggml_cast(ctx0, sk, GGML_TYPE_F32);
+                sv = ggml_cast(ctx0, sv, GGML_TYPE_F32);
+                ggml_tensor * Kf32 = ggml_cast(ctx0, Kcur, GGML_TYPE_F32);
+                ggml_tensor * Vf32 = ggml_cast(ctx0, Vcur, GGML_TYPE_F32);
+                Kcur = ggml_concat(ctx0, Kf32, sk, 2);
+                Vcur = ggml_concat(ctx0, Vf32, sv, 2);
             }
 
             cur = build_attn(inp_attn,
@@ -287,18 +300,18 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        // Query RAG once at layer 17 (knowledge boundary), cache for gas cloud
-        if (cache.rag_docs && il == split_layer - 1 && !rag_ctx_cached) {
-            ggml_tensor * sim = ggml_mul_mat(ctx0, cache.rag_docs, cur);
-            sim = ggml_scale(ctx0, sim, 50.0f);
-            sim = ggml_soft_max(ctx0, sim);
-            ggml_tensor * t_rag = ggml_cont(ctx0, ggml_transpose(ctx0, cache.rag_docs));
-            rag_ctx_cached = ggml_mul_mat(ctx0, t_rag, sim);
-        }
-
-        // Gas cloud: sustained injection across reasoning layers 20-26
-        if (rag_ctx_cached && il >= 20 && il <= 26) {
-            cur = ggml_add(ctx0, cur, ggml_scale(ctx0, rag_ctx_cached, 2.0f));
+        // Hand-to-hand: progressive blend from layer 0 through 35
+        // Phase 1 (0-7): inception - tiny seed (1-8%)
+        // Phase 2 (8-17): fact finding - ramp up (10-50%)
+        // Phase 3 (18-35): reasoning + output - dominate (55-100%)
+        if (rag_ctx_cached && il <= 35) {
+            float blend;
+            if (il < 8)       blend = (il + 1) * 0.01f;       // 1-8%
+            else if (il < 18) blend = 0.08f + (il-7)*0.04f;    // 12-48%
+            else              blend = 0.50f + (il-17)*0.03f;   // 53-104%
+            ggml_tensor * rag_part = ggml_scale(ctx0, rag_ctx_cached, blend);
+            ggml_tensor * model_part = ggml_scale(ctx0, cur, 1.0f - blend);
+            cur = ggml_add(ctx0, model_part, rag_part);
         }
 
         // BRAINLOOP: after layer 17, before 18 — matches PyTorch placement
