@@ -1,5 +1,6 @@
 #include "models.h"
 #include <ggml-alloc.h>
+#include "../llama-impl.h"
 #include <fstream>
 #include <vector>
 #include <string>
@@ -51,6 +52,9 @@ struct brainloop_gpu_cache {
 
     struct ggml_tensor * gate   = nullptr;
     struct ggml_tensor * rev_emb = nullptr;
+
+    // Cartridge: per-layer V vectors from real forward pass
+    struct ggml_tensor * cart_v = nullptr;  // [n_layers, n_kv_dim]
 
     float gate_sigmoid = 0.5f;
 };
@@ -158,6 +162,20 @@ static brainloop_gpu_cache & get_brainloop_cache(
         ggml_backend_buffer_name(buf), cache.gate_sigmoid, n_tensors);
 
     cache.initialized = true;
+
+    // Load cartridge V vectors
+    {
+        brainloop_weight bw_v = load_brainloop_weight("rag-experiment/cartridge_v.bin");
+        if (!bw_v.data.empty()) {
+            struct ggml_init_params rp = { ggml_tensor_overhead() * 2, nullptr, true };
+            struct ggml_context * rctx = ggml_init(rp);
+            cache.cart_v = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, bw_v.cols, bw_v.rows);
+            ggml_backend_buffer_t rbuf = ggml_backend_alloc_ctx_tensors_from_buft(rctx, buft);
+            ggml_backend_tensor_set(cache.cart_v, bw_v.data.data(), 0, bw_v.data.size() * sizeof(float));
+            fprintf(stderr, "BRAINLOOP: loaded cartridge V (%d layers x %d dim)\n", bw_v.rows, bw_v.cols);
+        }
+    }
+
     return cache;
 }
 
@@ -210,6 +228,31 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     1.0f/sqrtf(float(n_embd_head)), il);
+        }
+
+        // Cartridge V injection: V expanded 2->16 heads, projected via wo, added to hidden
+        if (cache.cart_v && il >= split_layer) {
+            struct ggml_init_params rp = { ggml_tensor_overhead() + sizeof(int32_t), nullptr, false };
+            struct ggml_context * rctx = ggml_init(rp);
+            ggml_tensor * row_idx = ggml_new_tensor_1d(rctx, GGML_TYPE_I32, 1);
+            if (row_idx->data) ((int32_t*)row_idx->data)[0] = il;
+            ggml_tensor * cv = ggml_get_rows(ctx0, cache.cart_v, row_idx);
+            int n_kvh = (int)n_head_kv;
+            // Expand from [n_kvh*n_embd_head] to [n_head*n_embd_head = n_embd]
+            cv = ggml_reshape_3d(ctx0, cv, (int)n_embd_head, n_kvh, 1);
+            // Expand 2->16 heads: concat original cv repeatedly
+            ggml_tensor * cve = cv;  // accumulator
+            for (int r = 1; r < (int)n_head / n_kvh; r++)
+                cve = ggml_concat(ctx0, cve, cv, 1);
+            // Flatten to [n_embd, 1]
+            cve = ggml_reshape_2d(ctx0, cve, n_embd_i, 1);
+            // Project through output weight
+            ggml_tensor * cart_proj = ggml_mul_mat(ctx0, model.layers[il].wo, cve);
+            if (model.layers[il].wo_b) cart_proj = ggml_add(ctx0, cart_proj, model.layers[il].wo_b);
+            // Broadcast from [n_embd, 1] to [n_embd, n_tokens]
+            cart_proj = ggml_repeat(ctx0, cart_proj, cur);
+            cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_proj, 0.001f));
+            fprintf(stderr, "CART L%d: injected\n", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
