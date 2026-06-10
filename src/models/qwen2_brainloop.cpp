@@ -231,7 +231,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
         }
 
         // Cartridge V injection: V expanded 2->16 heads, projected via wo, added to hidden
-        if (cache.cart_v && il >= split_layer) {
+        if (false && cache.cart_v && il >= split_layer) {
             struct ggml_init_params rp = { ggml_tensor_overhead() + sizeof(int32_t), nullptr, false };
             struct ggml_context * rctx = ggml_init(rp);
             ggml_tensor * row_idx = ggml_new_tensor_1d(rctx, GGML_TYPE_I32, 1);
