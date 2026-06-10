@@ -231,7 +231,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
         }
 
         // Cartridge V injection: V expanded 2->16 heads, projected via wo, added to hidden
-        if (cache.cart_v && il >= split_layer) {
+        if (cache.cart_v && il >= 30 && il <= 33) {
             struct ggml_init_params rp = { ggml_tensor_overhead() + sizeof(int32_t), nullptr, false };
             struct ggml_context * rctx = ggml_init(rp);
             ggml_tensor * row_idx = ggml_new_tensor_1d(rctx, GGML_TYPE_I32, 1);
@@ -256,7 +256,7 @@ llm_build_qwen2_brainloop::llm_build_qwen2_brainloop(
             ggml_tensor * ones = ggml_new_tensor_1d(octx, GGML_TYPE_F32, nt);
             if (ones->data) { float *d = (float*)ones->data; for (int i=0; i<nt; i++) d[i]=1.0f; }
             ggml_tensor * cart_bc = ggml_mul_mat(ctx0, cart_T, ones);
-            cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_bc, 0.001f));
+            cur = ggml_add(ctx0, cur, ggml_scale(ctx0, cart_bc, 2.0f));
             fprintf(stderr, "CART L%d: injected\n", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
